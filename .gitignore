@@ -81,3 +81,7 @@ crashlytics-build.properties
 /[Aa]ssets/[Tt]extMesh Pro
 
 .idea
+
+/.vscode
+
+/[Aa]ssets/Debug

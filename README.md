@@ -28,6 +28,15 @@ UnityでMQTT通信を簡単に扱うためのラッパーです。
 - 空のGameObjectを作成し、`MqttComManager`コンポーネントをアタッチします。
 - InspectorでBrokerのドメイン、ポート、認証情報などを設定します。
 
+#### 1-ex. CA証明書を組み込む
+CA証明書を用いて，MQTTサーバを検証してTLS接続できるようになりました．
+1. **CA証明書(.certファイル)の拡張子を.txtにする**(こうしないとInspectorで指定できない)
+1. MqttComManagerのEnable Ca Server Authにチェックを入れる
+1. 拡張子を変えたCA証明書ファイルをUnityに入れ，Ca Cert Fileにいれる
+
+あとは認証情報があっていれば，TLS接続に変更されるはず
+注：MQTTサーバのオレオレ証明書を使っているのを想定しているので，常にRevocationMode = Falseにしてます
+
 ### 2. サブスクライブ（購読）
 
 ```csharp

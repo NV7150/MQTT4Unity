@@ -2,6 +2,8 @@
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -29,6 +31,7 @@ namespace MQTT4Unity {
         [SerializeField] private int port = 8883;
         [SerializeField] private UserAuthentication userAuth;
         [SerializeField] private ClientIdAuthentication clientIdAuth;
+        [SerializeField] private CaServerAuthentication caAuth;
         [SerializeField] private MqttQualityOfServiceLevel defaultQos;
         [SerializeField] private bool connectOnAwake = true;
 
@@ -52,6 +55,9 @@ namespace MQTT4Unity {
         private bool _endProcess = false;
         
         private MqttNetEventLogger _logger;
+        
+        // CA certificate cache (preloaded on main thread)
+        private X509Certificate2 _cachedCaCert;
 
         delegate void DelayedPublish();
         DelayedPublish _delayedPublish;
@@ -79,35 +85,127 @@ namespace MQTT4Unity {
                 return;
             _isStartUp = true;
 
+            if (caAuth.EnableCaServerAuth && !string.IsNullOrEmpty(caAuth.CaCert))
+                LoadCaCertificate();
+            
+            var clientOptions = BuildMqttClientOptions();
+            CreateMqttClientAndConnect(clientOptions);
+        }
+
+        /// <summary>
+        /// Preload CA certificate on main thread
+        /// </summary>
+        private void LoadCaCertificate() {
+            try {
+                var caCertBytes = Encoding.UTF8.GetBytes(caAuth.CaCert);
+                _cachedCaCert = new X509Certificate2(caCertBytes);
+                _mqttLogs.Enqueue($"CA certificate loaded successfully. Subject: {_cachedCaCert.Subject}");
+            } catch (Exception ex) {
+                _mqttLogs.Enqueue($"Failed to load CA certificate: {ex.Message}");
+                _cachedCaCert = null;
+            }
+        }
+
+        /// <summary>
+        /// Build MQTT client options
+        /// </summary>
+        private MqttClientOptions BuildMqttClientOptions() {
             var option = new MqttClientOptionsBuilder();
+            
+            // Authentication settings
             if (userAuth.EnableAuth)
                 option.WithCredentials(userAuth.UserName, userAuth.Password);
-            
             if (clientIdAuth.EnableAuth)
                 option.WithClientId(clientIdAuth.ClientId);
-    
+            
+            // Server connection settings
             option.WithTcpServer(brokerDomain, port);
             
+            // TLS settings
+            if (caAuth.EnableCaServerAuth) {
+                option.WithTlsOptions(tlsOptions => {
+                    tlsOptions.UseTls(true);
+                    tlsOptions.WithSslProtocols(SslProtocols.Tls12);
+
+                    if(_cachedCaCert == null) {
+                        throw new InvalidOperationException("TLS Certificate not set");
+                    }
+                    tlsOptions.WithCertificateValidationHandler(ValidateServerCertificate);
+                    
+                });
+                _mqttLogs.Enqueue($"TLS configuration applied - Port: {port}, HasCACert: {_cachedCaCert != null}");
+            }
+            
+            return option.Build();
+        }
+
+        /// <summary>
+        /// Create MQTT client and start connection
+        /// </summary>
+        private void CreateMqttClientAndConnect(MqttClientOptions clientOptions) {
+            // Logger setup
             _logger = new MqttNetEventLogger();
             _logger.LogMessagePublished += (s, e) => {
                 var trace = $">> [{e.LogMessage.Level}] {e.LogMessage.Source}: {e.LogMessage.Message}";
                 if (e.LogMessage.Exception != null) {
                     trace += Environment.NewLine + e.LogMessage.Exception;
                 }
-
                 _mqttLogs.Enqueue(trace);
             };
             
+            // Client creation
             var builder = new MqttFactory(_logger);
             _client = builder.CreateMqttClient();
             _client.ConnectedAsync += Connected;
             _client.DisconnectedAsync += Disconnected;
             _client.ApplicationMessageReceivedAsync += OnRecv;
             
-            _ = Connect(option.Build());
-            
+            // Start connection and coroutines
+            _ = Connect(clientOptions);
             StartCoroutine(ResolveSubscribes());
             StartCoroutine(ResolveLogs());
+        }
+
+        /// <summary>
+        /// Server certificate validation using CA certificate
+        /// </summary>
+        private bool ValidateServerCertificate(MqttClientCertificateValidationEventArgs context) {
+            try {
+                var serverCert = new X509Certificate2(context.Certificate);
+                
+                // Build certificate chain
+                var chain = new X509Chain();
+                chain.ChainPolicy.ExtraStore.Add(_cachedCaCert);
+                chain.ChainPolicy.RevocationMode = X509RevocationMode.NoCheck; // Disable revocation check
+                chain.ChainPolicy.VerificationFlags = X509VerificationFlags.AllowUnknownCertificateAuthority;
+                
+                bool isValid = chain.Build(serverCert);
+                
+                // Log output
+                if (!isValid) {
+                    var errors = "Certificate chain validation failed:\n";
+                    foreach (X509ChainStatus status in chain.ChainStatus) {
+                        errors += $"Chain error: {status.Status} - {status.StatusInformation}\n";
+                    }
+                    _mqttLogs.Enqueue(errors);
+                } else {
+                    _mqttLogs.Enqueue("Certificate chain validation successful");
+                }
+                
+                // Verify root certificate
+                var rootCert = chain.ChainElements[chain.ChainElements.Count - 1].Certificate;
+                bool isRootValid = rootCert.Thumbprint.Equals(_cachedCaCert.Thumbprint, StringComparison.OrdinalIgnoreCase);
+                
+                if (!isRootValid) {
+                    _mqttLogs.Enqueue($"Root certificate mismatch. Expected: {_cachedCaCert.Thumbprint}, Got: {rootCert.Thumbprint}");
+                }
+                
+                return isValid && isRootValid;
+            }
+            catch (Exception ex) {
+                _mqttLogs.Enqueue($"Certificate validation failed: {ex.Message}");
+                return false;
+            }
         }
 
         // Run subscribe callback with coroutine in main thread
@@ -286,5 +384,15 @@ namespace MQTT4Unity {
         public bool EnableAuth => enableAuth;
 
         public string ClientId => clientId;
+    }
+
+    [Serializable]
+    public class CaServerAuthentication {
+        [SerializeField] private bool enableCaServerAuth = false;
+        [SerializeField] private TextAsset caCertFile;
+
+        public bool EnableCaServerAuth => enableCaServerAuth;
+
+        public string CaCert => caCertFile?.text ?? string.Empty;
     }
 }
